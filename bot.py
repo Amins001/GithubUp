@@ -1,6 +1,5 @@
 import os
 import re
-import sys
 import time
 import asyncio
 import subprocess
@@ -51,14 +50,12 @@ def resolve_custom_filename(orig_name: str, caption: str | None) -> str:
         return sanitize_filename(orig_name)
 
     first_line = caption.strip().splitlines()[0].strip()
-    # نادیده گرفتن کپشن اگر دستور ربات یا لینک باشد
     if first_line.startswith("/") or first_line.startswith("http"):
         return sanitize_filename(orig_name)
 
     custom_name = sanitize_filename(first_line)
     _, custom_ext = os.path.splitext(custom_name)
 
-    # اگر کاربر در کپشن پسوند ننوشته بود، پسوند اصلی فایل را اضافه کن
     if not custom_ext and orig_ext:
         custom_name += orig_ext
 
@@ -111,8 +108,46 @@ async def tg_progress_bar(current, total, client: Client, status_msg: Message, s
         pass
 
 
+async def async_file_sender(local_path: str, total_size: int, status_msg: Message, clean_filename: str):
+    """خواندن غیرهمزمان فایل برای سازگاری با httpx.AsyncClient + نمایش درصد آپلود"""
+    global cancel_requested
+    current = 0
+    start_t = time.time()
+    chunk_size = 512 * 1024  # تکه‌های 512 کیلوبایتی
+
+    with open(local_path, "rb") as f:
+        while chunk := f.read(chunk_size):
+            if cancel_requested:
+                raise asyncio.CancelledError("عملیات توسط کاربر لغو شد.")
+            current += len(chunk)
+
+            now = time.time()
+            last_edit = getattr(status_msg, "_last_edit", 0)
+            if now - last_edit >= 4 or current == total_size:
+                status_msg._last_edit = now
+                elapsed = now - start_t
+                speed = current / elapsed if elapsed > 0 else 0
+                pct = (current * 100 / total_size) if total_size else 0
+                eta = (total_size - current) / speed if speed > 0 else 0
+                try:
+                    await status_msg.edit_text(
+                        f"☁️ **در حال آپلود روی سرور گیت‌هاب...**\n\n"
+                        f"📄 نام فایل: `{clean_filename}`\n"
+                        f"📊 پیشرفت: `{pct:.1f}%`\n"
+                        f"📦 آپلود شده: `{human_size(current)}` از `{human_size(total_size)}`\n"
+                        f"🚀 سرعت: `{human_size(speed)}/s`\n"
+                        f"⏳ زمان باقی‌مانده: `{int(eta)} ثانیه`",
+                        reply_markup=get_cancel_kb()
+                    )
+                except Exception:
+                    pass
+
+            yield chunk
+            await asyncio.sleep(0)
+
+
 async def upload_file_to_github(local_path: str, clean_filename: str, status_msg: Message) -> tuple[int, str, str, int]:
-    """ایجاد Release و آپلود فایل روی گیت‌هاب"""
+    """ایجاد Release و آپلود استریم غیرهمزمان فایل روی گیت‌هاب"""
     global cancel_requested
     if cancel_requested:
         raise asyncio.CancelledError("عملیات توسط کاربر لغو شد.")
@@ -144,38 +179,32 @@ async def upload_file_to_github(local_path: str, clean_filename: str, status_msg
         release_id = release_data["id"]
         upload_url = release_data["upload_url"].split("{")[0]
 
-        if cancel_requested:
-            await http.delete(f"https://api.github.com/repos/{GITHUB_REPO}/releases/{release_id}", headers=GH_HEADERS)
-            raise asyncio.CancelledError("عملیات توسط کاربر لغو شد.")
+        try:
+            upload_headers = {
+                **GH_HEADERS,
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(file_size)
+            }
 
-        await status_msg.edit_text(
-            f"☁️ **در حال آپلود روی سرور گیت‌هاب...**\n\n"
-            f"📄 نام فایل: `{clean_filename}`\n"
-            f"📦 حجم: `{human_size(file_size)}`\n"
-            f"*(لطفاً صبر کنید...)*",
-            reply_markup=get_cancel_kb()
-        )
-
-        upload_headers = {
-            **GH_HEADERS,
-            "Content-Type": "application/octet-stream",
-            "Content-Length": str(file_size)
-        }
-
-        with open(local_path, "rb") as f:
             up_resp = await http.post(
                 upload_url,
                 params={"name": clean_filename},
                 headers=upload_headers,
-                content=f
+                content=async_file_sender(local_path, file_size, status_msg, clean_filename)
             )
 
-        if up_resp.status_code != 201:
-            raise Exception(f"خطا در آپلود فایل: {up_resp.text}")
+            if up_resp.status_code != 201:
+                raise Exception(f"خطا در آپلود فایل: {up_resp.text}")
 
-        asset_data = up_resp.json()
-        direct_link = asset_data["browser_download_url"]
-        return release_id, release_title, direct_link, file_size
+            asset_data = up_resp.json()
+            direct_link = asset_data["browser_download_url"]
+            return release_id, release_title, direct_link, file_size
+
+        except Exception as e:
+            # اگر وسط آپلود خطایی رخ داد یا کاربر کنسل کرد، ریلیز خالی ساخته شده را از گیت‌هاب پاک کن
+            await http.delete(f"https://api.github.com/repos/{GITHUB_REPO}/releases/{release_id}", headers=GH_HEADERS)
+            await http.delete(f"https://api.github.com/repos/{GITHUB_REPO}/git/refs/tags/{tag_name}", headers=GH_HEADERS)
+            raise e
 
 
 @app.on_message(filters.command(["start", "help"]) & filters.user(ADMIN_ID))
@@ -184,7 +213,7 @@ async def start_cmd(client: Client, message: Message):
         "👋 **به ربات آپلودر مستقیم گیت‌هاب خوش آمدید!**\n\n"
         "📌 **امکانات و نحوه استفاده:**\n\n"
         "1️⃣ **آپلود فایل یا ویدیو:**\n"
-        "هر فایل، ویدیو یا فایلی را (تا سقف ۲ گیگابایت) مستقیم ارسال یا فوروارد کنید تا لینک مستقیم گیت‌هاب دریافت کنید.\n\n"
+        "هر فایل یا ویدیویی را (تا سقف ۲ گیگابایت) مستقیم ارسال یا فوروارد کنید تا لینک مستقیم گیت‌هاب دریافت کنید.\n\n"
         "2️⃣ **تغییر نام فایل قبل از آپلود (Rename):**\n"
         "کافیست هنگام ارسال یا فوروارد فایل، نام جدید را در **کپشن (Caption)** بنویسید (مثلاً `episode_01.mp4` یا فقط `episode_01`). ربات فایل را با نام دلخواه شما آپلود می‌کند.\n\n"
         "3️⃣ **لیچر لینک مستقیم (`/url`):**\n"
@@ -424,7 +453,6 @@ async def update_bot_cmd(client: Client, message: Message):
             f"📋 خروجی:\n`{output}`\n\n"
             f"♻️ ربات در حال ری‌استارت شدن است (تا ۵ ثانیه دیگر آماده می‌شود)..."
         )
-        # خروج از برنامه تا systemd به صورت خودکار سرویس را با کد جدید بالا بیاورد
         os._exit(0)
     except Exception as e:
         await status.edit_text(f"❌ **خطا در بروزرسانی:**\n`{str(e)}`")
@@ -445,7 +473,6 @@ async def handle_media(client: Client, message: Message):
         ext = ".mp4" if message.video else (".mp3" if message.audio else ".bin")
         orig_name = f"media_{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext}"
 
-    # بررسی کپشن برای تغییر نام فایل
     clean_filename = resolve_custom_filename(orig_name, message.caption)
     local_path = os.path.join(DOWNLOAD_DIR, f"{tag_time}_{clean_filename}")
 
