@@ -26,8 +26,11 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 app = Client("github_uploader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 upload_lock = asyncio.Lock()
 
-# متغیر سراسری برای مدیریت لغو عملیات در حال انجام
+# متغیرهای سراسری برای مدیریت لغو و تغییر نام پویا (قبل یا حین دانلود)
 cancel_requested = False
+pending_custom_name: str | None = None
+active_download_ext: str = ""
+active_final_filename: str = ""
 
 GH_HEADERS = {
     "Authorization": f"Bearer {GITHUB_TOKEN}",
@@ -43,23 +46,35 @@ def sanitize_filename(name: str) -> str:
     return name.strip('_') or f"file_{int(time.time())}"
 
 
-def resolve_custom_filename(orig_name: str, caption: str | None) -> str:
-    """تغییر نام فایل بر اساس کپشن ارسالی با حفظ پسوند اصلی در صورت فراموشی"""
-    orig_base, orig_ext = os.path.splitext(orig_name)
-    if not caption:
-        return sanitize_filename(orig_name)
+def build_filename_with_ext(custom_text: str, orig_ext: str) -> str:
+    """ساخت نام تمیز و اضافه کردن پسوند اصلی فایل در صورتی که کاربر پسوند ننوشته باشد"""
+    clean = sanitize_filename(custom_text)
+    _, ext = os.path.splitext(clean)
+    if not ext and orig_ext:
+        clean += orig_ext
+    return clean
 
-    first_line = caption.strip().splitlines()[0].strip()
-    if first_line.startswith("/") or first_line.startswith("http"):
-        return sanitize_filename(orig_name)
 
-    custom_name = sanitize_filename(first_line)
-    _, custom_ext = os.path.splitext(custom_name)
+def resolve_initial_filename(orig_name: str, explicit_custom: str | None) -> tuple[str, str]:
+    """تعیین نام اولیه فایل با بررسی نام از قبل ذخیره شده یا کپشن مجاز"""
+    global pending_custom_name
+    _, orig_ext = os.path.splitext(orig_name)
 
-    if not custom_ext and orig_ext:
-        custom_name += orig_ext
+    # اولویت ۱: نامی که کاربر قبل از ارسال فایل در چت فرستاده است
+    if pending_custom_name:
+        chosen = build_filename_with_ext(pending_custom_name, orig_ext)
+        pending_custom_name = None
+        return chosen, orig_ext
 
-    return custom_name
+    # اولویت ۲: کپشن مستقیم (برای فایل غیرفورواردی) یا خط دوم لینک
+    if explicit_custom:
+        first_line = explicit_custom.strip().splitlines()[0].strip()
+        if not first_line.startswith("/") and not first_line.startswith("http"):
+            chosen = build_filename_with_ext(first_line, orig_ext)
+            return chosen, orig_ext
+
+    # اولویت ۳: نام خودکار خود فایل
+    return sanitize_filename(orig_name), orig_ext
 
 
 def human_size(size_bytes: int) -> str:
@@ -78,8 +93,8 @@ def get_cancel_kb() -> InlineKeyboardMarkup:
 
 
 async def tg_progress_bar(current, total, client: Client, status_msg: Message, start_time: float, stage: str):
-    """نمایش پیشرفت دانلود از تلگرام + بررسی درخواست لغو"""
-    global cancel_requested
+    """نمایش پیشرفت دانلود از تلگرام + نمایش نام فعلی + بررسی درخواست لغو"""
+    global cancel_requested, active_final_filename
     if cancel_requested:
         client.stop_transmission()
         return
@@ -97,10 +112,12 @@ async def tg_progress_bar(current, total, client: Client, status_msg: Message, s
 
     text = (
         f"🔄 **{stage}**\n\n"
+        f"📄 نام نهایی: `{active_final_filename}`\n"
         f"📊 پیشرفت: `{percentage:.1f}%`\n"
         f"📦 حجم: `{human_size(current)}` از `{human_size(total)}`\n"
         f"🚀 سرعت: `{human_size(speed)}/s`\n"
-        f"⏳ زمان باقی‌مانده: `{int(eta)} ثانیه`"
+        f"⏳ زمان باقی‌مانده: `{int(eta)} ثانیه`\n\n"
+        f"💡 *(برای تغییر نام، همین الان نام جدید را تایپ و ارسال کنید)*"
     )
     try:
         await status_msg.edit_text(text, reply_markup=get_cancel_kb())
@@ -113,7 +130,7 @@ async def async_file_sender(local_path: str, total_size: int, status_msg: Messag
     global cancel_requested
     current = 0
     start_t = time.time()
-    chunk_size = 512 * 1024  # تکه‌های 512 کیلوبایتی
+    chunk_size = 512 * 1024
 
     with open(local_path, "rb") as f:
         while chunk := f.read(chunk_size):
@@ -201,7 +218,6 @@ async def upload_file_to_github(local_path: str, clean_filename: str, status_msg
             return release_id, release_title, direct_link, file_size
 
         except Exception as e:
-            # اگر وسط آپلود خطایی رخ داد یا کاربر کنسل کرد، ریلیز خالی ساخته شده را از گیت‌هاب پاک کن
             await http.delete(f"https://api.github.com/repos/{GITHUB_REPO}/releases/{release_id}", headers=GH_HEADERS)
             await http.delete(f"https://api.github.com/repos/{GITHUB_REPO}/git/refs/tags/{tag_name}", headers=GH_HEADERS)
             raise e
@@ -211,37 +227,35 @@ async def upload_file_to_github(local_path: str, clean_filename: str, status_msg
 async def start_cmd(client: Client, message: Message):
     help_text = (
         "👋 **به ربات آپلودر مستقیم گیت‌هاب خوش آمدید!**\n\n"
-        "📌 **امکانات و نحوه استفاده:**\n\n"
-        "1️⃣ **آپلود فایل یا ویدیو:**\n"
-        "هر فایل یا ویدیویی را (تا سقف ۲ گیگابایت) مستقیم ارسال یا فوروارد کنید تا لینک مستقیم گیت‌هاب دریافت کنید.\n\n"
-        "2️⃣ **تغییر نام فایل قبل از آپلود (Rename):**\n"
-        "کافیست هنگام ارسال یا فوروارد فایل، نام جدید را در **کپشن (Caption)** بنویسید (مثلاً `episode_01.mp4` یا فقط `episode_01`). ربات فایل را با نام دلخواه شما آپلود می‌کند.\n\n"
-        "3️⃣ **لیچر لینک مستقیم (`/url`):**\n"
-        "برای دانلود مستقیم فایل از اینترنت به سرور و آپلود در گیت‌هاب:\n"
-        "`/url https://example.com/video.mp4`\n"
-        "یا همراه با تغییر نام:\n"
-        "`/url https://example.com/video.mp4 new_name.mp4`\n\n"
-        "4️⃣ **جستجو در فایل‌های آپلود شده (`/search`):**\n"
-        "`/search نام_فایل`\n\n"
-        "5️⃣ **مدیریت و حذف فایل‌های اخیر (`/files`):**\n"
-        "مشاهده ۱۰ فایل آخر به همراه تعداد دانلود و دکمه حذف از گیت‌هاب.\n\n"
-        "6️⃣ **لغو عملیات در حال انجام (`/cancel`):**\n"
-        "توقف فوری دانلود یا آپلود فعلی و پاکسازی فایل موقت.\n\n"
-        "7️⃣ **بروزرسانی خودکار ربات (`/update`):**\n"
-        "دریافت آخرین تغییرات کد از مخزن گیت‌هاب (`git pull`) و ری‌استارت خودکار ربات.\n\n"
-        "🎬 **نکته پخش آنلاین:** لینک‌های خروجی را می‌توانید در پلیرهایی مثل **VLC** یا **MX Player** قرار دهید تا بدون نیاز به دانلود کامل، به صورت آنلاین استریم شوند."
+        "📌 **راهنمای کامل استفاده و تغییر نام فایل‌ها:**\n\n"
+        "1️⃣ **حالت خودکار (بدون نیاز به ورود نام):**\n"
+        "فایل یا ویدیو را فوروارد/ارسال کنید یا لینک مستقیم بفرستید؛ ربات بلافاصله و بدون معطلی با نام اصلی شروع به دانلود و آپلود می‌کند. (کپشن‌های تبلیغاتی فایل‌های فوروارد شده به طور خودکار نادیده گرفته می‌شوند).\n\n"
+        "2️⃣ **روش‌های تغییر نام فایل (۴ روش به انتخاب شما):**\n"
+        "🔹 **قبل از ارسال فایل:** ابتدا نام دلخواه را در یک پیام متنی ساده بفرستید (مثلاً `lecture_01`) و بلافاصله بعدش فایل را فوروارد کنید یا لینک بدهید.\n"
+        "🔸 **در حین دانلود (Live):** وقتی ربات در حال دانلود فایل است، هر زمان نام جدید را به صورت متن ساده بفرستید، نام فایل درجا عوض می‌شود!\n"
+        "🔹 **با کپشن (فقط در آپلود مستقیم):** اگر فایلی را مستقیم (بدون فوروارد) آپلود می‌کنید، نام دلخواه را در کپشن آن بنویسید.\n"
+        "🔸 **برای لینک‌های دانلود (در خط دوم):** لینک را در خط اول و نام دلخواه را در خط دوم همان پیام بنویسید:\n"
+        "`https://example.com/file.mp4`\n"
+        "`my_custom_name`\n\n"
+        "🛠 **دستورات مدیریتی ربات:**\n"
+        "• `/files` : مشاهده ۱۰ فایل آخر، تعداد دانلودها و دکمه حذف\n"
+        "• `/search <نام>` : جستجو در بین تمام فایل‌های آپلود شده\n"
+        "• `/cancel` : لغو فوری دانلود یا آپلود در حال انجام\n"
+        "• `/update` : دریافت آخرین کد از گیت‌هاب (`git pull`) و ری‌استارت خودکار\n\n"
+        "🎬 **پخش آنلاین:** لینک‌های خروجی را می‌توانید در پلیرهایی مثل **VLC** یا **MX Player** بگذارید تا بدون نیاز به دانلود کامل، آنلاین پخش شوند."
     )
     await message.reply_text(help_text, disable_web_page_preview=True)
 
 
 @app.on_message(filters.command("cancel") & filters.user(ADMIN_ID))
 async def cancel_cmd(client: Client, message: Message):
-    global cancel_requested
+    global cancel_requested, pending_custom_name
+    pending_custom_name = None
     if upload_lock.locked():
         cancel_requested = True
         await message.reply_text("🛑 درخواست لغو ثبت شد؛ عملیات در حال توقف و پاکسازی است...")
     else:
-        await message.reply_text("ℹ️ در حال حاضر هیچ عملیاتی در حال انجام نیست.")
+        await message.reply_text("ℹ️ عملیات فعالی وجود نداشت (نام ذخیره شده قبلی هم پاک شد).")
 
 
 @app.on_callback_query(filters.regex(r"^cancel_task$") & filters.user(ADMIN_ID))
@@ -343,34 +357,29 @@ async def search_files_cmd(client: Client, message: Message):
             await message.reply_text(text, reply_markup=kb, disable_web_page_preview=True)
 
 
-@app.on_message(filters.command("url") & filters.user(ADMIN_ID))
-async def url_leech_cmd(client: Client, message: Message):
-    global cancel_requested
-    if len(message.command) < 2:
-        return await message.reply_text(
-            "⚠️ لطفاً لینک مستقیم فایل را وارد کنید.\n"
-            "مثال:\n`/url https://example.com/file.mp4`\n"
-            "یا با نام دلخواه:\n`/url https://example.com/file.mp4 my_video.mp4`"
-        )
-
-    url = message.command[1]
-    custom_name = " ".join(message.command[2:]) if len(message.command) > 2 else None
+async def process_url_download(message: Message, url: str, explicit_name: str | None):
+    """تابع مشترک برای دانلود از لینک مستقیم (با دستور /url یا ارسال مستقیم لینک)"""
+    global cancel_requested, active_download_ext, active_final_filename
 
     parsed_path = unquote(urlparse(url).path)
     orig_name = os.path.basename(parsed_path) or f"url_file_{int(time.time())}.bin"
-    clean_filename = resolve_custom_filename(orig_name, custom_name)
+    initial_name, orig_ext = resolve_initial_filename(orig_name, explicit_name)
 
     tag_time = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:19]
-    local_path = os.path.join(DOWNLOAD_DIR, f"{tag_time}_{clean_filename}")
+    local_path = os.path.join(DOWNLOAD_DIR, f"{tag_time}_{initial_name}")
 
     status_msg = await message.reply_text("⏳ در صف انتظار برای دانلود از لینک...")
 
     async with upload_lock:
         cancel_requested = False
+        active_download_ext = orig_ext
+        active_final_filename = initial_name
+
         try:
             start_t = time.time()
             await status_msg.edit_text(
-                f"🌐 شروع دانلود از لینک:\n`{clean_filename}`",
+                f"🌐 شروع دانلود از لینک:\n`{active_final_filename}`\n\n"
+                f"💡 *(می‌توانید در حین دانلود، نام جدید را در چت بفرستید)*",
                 reply_markup=get_cancel_kb()
             )
 
@@ -399,17 +408,20 @@ async def url_leech_cmd(client: Client, message: Message):
                                 try:
                                     await status_msg.edit_text(
                                         f"🌐 **در حال دانلود از لینک به سرور...**\n\n"
-                                        f"📄 نام: `{clean_filename}`\n"
+                                        f"📄 نام نهایی: `{active_final_filename}`\n"
                                         f"📊 پیشرفت: `{pct:.1f}%`\n"
                                         f"📦 دریافت شده: `{human_size(current)}` از `{human_size(total) if total else 'نامشخص'}`\n"
-                                        f"🚀 سرعت: `{human_size(speed)}/s`",
+                                        f"🚀 سرعت: `{human_size(speed)}/s`\n\n"
+                                        f"💡 *(برای تغییر نام، همین الان نام جدید را تایپ و ارسال کنید)*",
                                         reply_markup=get_cancel_kb()
                                     )
                                 except Exception:
                                     pass
 
+            # استفاده از آخرین نام (در صورتی که کاربر حین دانلود نام را تغییر داده باشد)
+            final_clean_name = active_final_filename
             release_id, release_title, direct_link, file_size = await upload_file_to_github(
-                local_path, clean_filename, status_msg
+                local_path, final_clean_name, status_msg
             )
 
             kb = InlineKeyboardMarkup([
@@ -438,6 +450,29 @@ async def url_leech_cmd(client: Client, message: Message):
                     pass
 
 
+@app.on_message(filters.command("url") & filters.user(ADMIN_ID))
+async def url_leech_cmd(client: Client, message: Message):
+    text_lines = message.text.strip().splitlines()
+    first_line_parts = text_lines[0].split(maxsplit=2)
+
+    if len(first_line_parts) < 2:
+        return await message.reply_text(
+            "⚠️ لطفاً لینک مستقیم فایل را وارد کنید یا مستقیم لینک را بدون دستور بفرستید.\n"
+            "مثال همراه با نام در خط دوم:\n"
+            "`https://example.com/file.mp4`\n"
+            "`my_video.mp4`"
+        )
+
+    url = first_line_parts[1].strip()
+    custom_name = None
+    if len( text_lines ) > 1 and text_lines[1].strip():
+        custom_name = text_lines[1].strip()
+    elif len(first_line_parts) > 2:
+        custom_name = first_line_parts[2].strip()
+
+    await process_url_download(message, url, custom_name)
+
+
 @app.on_message(filters.command("update") & filters.user(ADMIN_ID))
 async def update_bot_cmd(client: Client, message: Message):
     status = await message.reply_text("🔄 در حال دریافت آخرین نسخه کد از گیت‌هاب (`git pull`)...")
@@ -460,7 +495,7 @@ async def update_bot_cmd(client: Client, message: Message):
 
 @app.on_message((filters.video | filters.document | filters.audio) & filters.user(ADMIN_ID))
 async def handle_media(client: Client, message: Message):
-    global cancel_requested
+    global cancel_requested, active_download_ext, active_final_filename
     media = message.video or message.document or message.audio
     file_size = media.file_size or 0
 
@@ -473,17 +508,25 @@ async def handle_media(client: Client, message: Message):
         ext = ".mp4" if message.video else (".mp3" if message.audio else ".bin")
         orig_name = f"media_{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext}"
 
-    clean_filename = resolve_custom_filename(orig_name, message.caption)
-    local_path = os.path.join(DOWNLOAD_DIR, f"{tag_time}_{clean_filename}")
+    # ایده ۴: اگر پیام فوروارد شده باشد، کپشن تبلیغاتی آن را نادیده بگیر
+    is_forwarded = bool(message.forward_date or message.forward_from or message.forward_from_chat or message.forward_sender_name)
+    allowed_caption = None if is_forwarded else message.caption
+
+    initial_name, orig_ext = resolve_initial_filename(orig_name, allowed_caption)
+    local_path = os.path.join(DOWNLOAD_DIR, f"{tag_time}_{initial_name}")
 
     status_msg = await message.reply_text("⏳ در صف انتظار برای پردازش...")
 
     async with upload_lock:
         cancel_requested = False
+        active_download_ext = orig_ext
+        active_final_filename = initial_name
+
         try:
             start_t = time.time()
             await status_msg.edit_text(
-                f"📥 شروع دانلود `{clean_filename}` از تلگرام...",
+                f"📥 شروع دانلود `{active_final_filename}` از تلگرام...\n\n"
+                f"💡 *(می‌توانید در حین دانلود، نام جدید را در چت بفرستید)*",
                 reply_markup=get_cancel_kb()
             )
             dl_result = await message.download(
@@ -495,8 +538,10 @@ async def handle_media(client: Client, message: Message):
             if cancel_requested or not dl_result or not os.path.exists(local_path):
                 raise asyncio.CancelledError("عملیات توسط کاربر لغو شد.")
 
+            # استفاده از آخرین نام (در صورتی که کاربر در حین دانلود نام جدیدی در چت فرستاده باشد)
+            final_clean_name = active_final_filename
             release_id, release_title, direct_link, final_size = await upload_file_to_github(
-                local_path, clean_filename, status_msg
+                local_path, final_clean_name, status_msg
             )
 
             kb = InlineKeyboardMarkup([
@@ -523,6 +568,47 @@ async def handle_media(client: Client, message: Message):
                     os.remove(local_path)
                 except Exception:
                     pass
+
+
+@app.on_message(filters.text & filters.user(ADMIN_ID) & ~filters.regex(r"^/"))
+async def handle_plain_text_or_links(client: Client, message: Message):
+    """مدیریت هوشمند پیام‌های متنی: تشخیص لینک (خط دوم = نام) یا تنظیم نام (قبل/حین دانلود)"""
+    global pending_custom_name, active_final_filename, active_download_ext
+
+    lines = [line.strip() for line in message.text.strip().splitlines() if line.strip()]
+    if not lines:
+        return
+
+    first_line = lines[0]
+
+    # ۱. اگر خط اول لینک مستقیم باشد (ایده ۳ - روش ب: خط دوم = نام فایل)
+    if first_line.startswith("http://") or first_line.startswith("https://"):
+        parts = first_line.split(maxsplit=1)
+        url = parts[0]
+        custom_name = None
+        if len(lines) > 1:
+            custom_name = lines[1]
+        elif len(parts) > 1:
+            custom_name = parts[1]
+
+        return await process_url_download(message, url, custom_name)
+
+    # ۲. اگر متن معمولی باشد و همین الان فایلی در حال دانلود باشد -> تغییر نام درجا (Live Rename)
+    if upload_lock.locked():
+        new_name = build_filename_with_ext(first_line, active_download_ext)
+        active_final_filename = new_name
+        return await message.reply_text(
+            f"✏️ **نام فایل در حال دانلود تغییر یافت به:**\n`{new_name}`\n\n"
+            f"*(پس از پایان دانلود، با همین نام روی گیت‌هاب آپلود خواهد شد)*"
+        )
+
+    # ۳. اگر متن معمولی باشد و دانلودی در جریان نباشد -> ذخیره نام برای فایل/لینک بعدی (Pre-Name)
+    pending_custom_name = sanitize_filename(first_line)
+    await message.reply_text(
+        f"📌 **نام `{pending_custom_name}` برای فایل بعدی ذخیره شد!**\n\n"
+        f"حالا ویدیو/فایل خود را فوروارد یا ارسال کنید (یا لینک بفرستید) تا با این نام آپلود شود.\n"
+        f"*(برای انصراف از این نام، دستور `/cancel` را بزنید)*"
+    )
 
 
 @app.on_callback_query(filters.regex(r"^del_(\d+)$") & filters.user(ADMIN_ID))
